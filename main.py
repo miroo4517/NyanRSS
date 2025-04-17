@@ -48,14 +48,12 @@ except ValueError as e:
 EMOJI = "\U0001F4F0"
 sent_articles_file = "sent_articles.yaml"
 yaml_lock = asyncio.Lock()
+max_keep = 5000
 
 try:
     genai.configure(api_key=GOOGLE_API_KEY)
     generation_config = {
-        "temperature": 0.7,
-        "top_p": 1,
-        "top_k": 1,
-        "max_output_tokens": 256,
+        "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 256,
     }
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -93,10 +91,10 @@ async def summarize_article(content):
         response = await model.generate_content_async(prompt)
 
         if not response.candidates:
-                print("경고: Gemini API 응답에 후보가 없습니다. 안전 설정 또는 입력 문제일 수 있습니다.")
-                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                    print(f"  프롬프트 피드백: {response.prompt_feedback}")
-                return "기사 요약 중 문제가 발생했습니다. (No candidates)"
+            print("경고: Gemini API 응답에 후보가 없습니다. 안전 설정 또는 입력 문제일 수 있습니다.")
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                print(f"  프롬프트 피드백: {response.prompt_feedback}")
+            return "기사 요약 중 문제가 발생했습니다. (No candidates)"
 
         summary = response.text.strip() if response.candidates else None
 
@@ -111,11 +109,7 @@ async def summarize_article(content):
         print(f"Gemini API 호출 중 오류 발생 ({type(e).__name__}): {e}")
         return f"기사 요약 중 API 오류가 발생했습니다: {type(e).__name__}"
 
-
-async def fetch_feed(channel, site_colors):
-    sent_articles = []
-    channel_id_str = str(channel.id)
-
+async def load_sent_articles(channel_id_str):
     async with yaml_lock:
         if os.path.exists(sent_articles_file):
             try:
@@ -124,17 +118,52 @@ async def fetch_feed(channel, site_colors):
                 sent_articles = all_sent_data.get(channel_id_str, [])
                 if not isinstance(sent_articles, list):
                     print(f"경고: 채널 {channel_id_str}의 sent_articles 데이터가 리스트가 아닙니다. 초기화합니다.")
-                    sent_articles = []
+                    return []
                 print(f"채널 {channel_id_str}: 기존 {len(sent_articles)}개 기사 링크 로드됨")
+                return sent_articles
             except Exception as e:
                 print(f"YAML 파일 로드 오류: {e}")
-                sent_articles = []
+                return []
         else:
             print("sent_articles.yaml 파일을 찾을 수 없어 새로 생성합니다.")
-            sent_articles = []
+            return []
+
+async def save_sent_article(channel_id_str, article_link, current_sent_list):
+    async with yaml_lock:
+        try:
+            if os.path.exists(sent_articles_file):
+                with open(sent_articles_file, "r", encoding='utf-8') as f:
+                    all_sent_data = yaml.safe_load(f) or {}
+            else:
+                all_sent_data = {}
+
+            channel_sent_list = all_sent_data.get(channel_id_str, [])
+            if not isinstance(channel_sent_list, list):
+                print(f"경고: 파일 저장 중 채널 {channel_id_str} 데이터가 리스트가 아님. 재생성.")
+                channel_sent_list = []
+
+            if article_link not in channel_sent_list:
+                 channel_sent_list.append(article_link)
+
+            if len(channel_sent_list) > max_keep:
+                original_count = len(channel_sent_list)
+                channel_sent_list = channel_sent_list[-max_keep:]
+                print(f"채널 {channel_id_str}: 오래된 기사 링크 정리 (파일 저장 시). {original_count} -> {len(channel_sent_list)}개 유지.")
+
+            all_sent_data[channel_id_str] = channel_sent_list
+            with open(sent_articles_file, "w", encoding='utf-8') as f:
+                yaml.dump(all_sent_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+            print(f"채널 {channel_id_str}: 기사 '{article_link}' 전송 완료 및 YAML 저장됨.")
+
+        except Exception as e:
+            print(f"sent_articles.yaml 파일 저장 중 오류 발생 (개별 저장): {e}")
+
+async def fetch_feed(channel, site_colors):
+    channel_id_str = str(channel.id)
+    sent_articles = await load_sent_articles(channel_id_str)
+    sent_articles_set = set(sent_articles)
 
     new_articles_processed_count = 0
-    max_keep = 5000
 
     for rss_feed_url in RSS_FEED_URLS:
         if not rss_feed_url: continue
@@ -157,14 +186,15 @@ async def fetch_feed(channel, site_colors):
             continue
 
         for entry in feed.entries:
-            if not hasattr(entry, 'link') or not entry.link:
-                print(f"  경고: 링크 없는 항목 발견. 건너뜁니다. (제목: {getattr(entry, 'title', 'N/A')})")
-                continue
+            article_id = getattr(entry, 'link', None)
+            if not article_id:
+                 article_id = getattr(entry, 'id', None)
+            if not article_id:
+                 print(f"  경고: 링크 또는 ID 없는 항목 발견. 건너뜁니다. (제목: {getattr(entry, 'title', 'N/A')})")
+                 continue
 
-            article_link = entry.link
-
-            if article_link in sent_articles:
-                print(f"  이미 처리된 항목: {article_link}")
+            if article_id in sent_articles_set:
+                print(f"  이미 처리된 항목: {article_id}")
                 continue
 
             new_articles_processed_count += 1
@@ -176,15 +206,13 @@ async def fetch_feed(channel, site_colors):
 
             summary = "요약 정보를 가져올 수 없었습니다."
             if article_content_text:
-                print("       Gemini API로 요약 요청 중...")
+                print("      Gemini API로 요약 요청 중...")
                 summary_start_time = time.monotonic()
                 summary = await summarize_article(article_content_text)
-                print(f"       요약 완료. 소요 시간: {time.monotonic() - summary_start_time:.2f}초")
+                print(f"      요약 완료. 소요 시간: {time.monotonic() - summary_start_time:.2f}초")
             else:
-                print("       요약할 내용이 없어 Gemini 호출을 건너뜁니다.")
+                print("      요약할 내용이 없어 Gemini 호출을 건너뜁니다.")
                 summary = "기사 본문 내용이 없어 요약할 수 없습니다."
-
-            sent_articles.append(article_link)
 
             try:
                 embed_color = Color.blue()
@@ -199,7 +227,7 @@ async def fetch_feed(channel, site_colors):
 
                 embed = Embed(
                     title=f"{EMOJI} {article_title}",
-                    url=article_link,
+                    url=article_id,
                     color=embed_color
                 )
 
@@ -208,13 +236,12 @@ async def fetch_feed(channel, site_colors):
                 if len(summary) > max_summary_length:
                     cutoff = max_summary_length - len("... (내용 축약됨)")
                     summary_to_display = f"{summary[:cutoff]}... (내용 축약됨)"
-                    print("       경고: 요약 내용이 너무 길어 Embed 필드에서 잘렸습니다.")
+                    print("      경고: 요약 내용이 너무 길어 Embed 필드에서 잘렸습니다.")
 
                 if summary:
                     embed.add_field(name="AI 냥냥 요약!", value=summary_to_display, inline=False)
 
                 image_url = None
-
                 if hasattr(entry, 'enclosures'):
                     for enclosure in entry.enclosures:
                         if enclosure.get('type', '').startswith('image/'):
@@ -222,7 +249,6 @@ async def fetch_feed(channel, site_colors):
                             if image_url:
                                 print(f"      이미지 발견 (enclosure): {image_url[:50]}...")
                                 break
-
                 if not image_url and hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
                     if isinstance(entry.media_thumbnail, list) and len(entry.media_thumbnail) > 0:
                         thumb_info = entry.media_thumbnail[0]
@@ -230,19 +256,16 @@ async def fetch_feed(channel, site_colors):
                             image_url = thumb_info['url']
                             if image_url:
                                 print(f"      이미지 발견 (media_thumbnail): {image_url[:50]}...")
-
                 if not image_url and hasattr(entry, 'media_content') and entry.media_content:
                     if isinstance(entry.media_content, list) and len(entry.media_content) > 0:
                         for media_item in entry.media_content:
                             if isinstance(media_item, dict) and 'url' in media_item:
                                 potential_url = media_item['url']
                                 is_image = False
-                                if media_item.get('type', '').startswith('image/'):
-                                    is_image = True
-                                elif media_item.get('medium') == 'image':
-                                    is_image = True
-                                elif potential_url and int(media_item['width']) > 400: # and any(potential_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                                    is_image = True
+                                if media_item.get('type', '').startswith('image/'): is_image = True
+                                elif media_item.get('medium') == 'image': is_image = True
+                                elif potential_url and media_item.get('width') and int(media_item['width']) > 200:
+                                     is_image = True
 
                                 if is_image and potential_url:
                                     image_url = potential_url
@@ -252,18 +275,18 @@ async def fetch_feed(channel, site_colors):
                 if image_url:
                     embed.set_image(url=image_url)
                     print(f"최종 선택된 이미지 URL: {image_url}")
-                    pass
                 else:
                     print("      이 항목에서 이미지를 찾지 못했습니다.")
 
+                published_dt = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     try:
-                        published_dt = datetime.datetime(*entry.published_parsed[:6])
+                        published_dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
                         kst = datetime.timezone(datetime.timedelta(hours=9))
-                        published_dt_kst = published_dt.replace(tzinfo=datetime.timezone.utc).astimezone(kst)
+                        published_dt_kst = published_dt.astimezone(kst)
                         embed.timestamp = published_dt_kst
                     except Exception as e:
-                        print(f"       발행 시각 변환 오류: {e}")
+                        print(f"      발행 시각 변환 오류: {e}")
                         embed.timestamp = utils.utcnow()
                 else:
                     embed.timestamp = utils.utcnow()
@@ -272,12 +295,16 @@ async def fetch_feed(channel, site_colors):
                 embed.set_footer(text=f"{feed_title}에서 불러온 정보다냥!")
 
                 await channel.send(embed=embed)
-                print("       >> Embed 형식으로 요약된 기사 정보를 채널에 성공적으로 전송했습니다.")
+                print("      >> Embed 전송 성공.")
+
+                await save_sent_article(channel_id_str, article_id, list(sent_articles_set))
+                sent_articles_set.add(article_id)
 
                 await asyncio.sleep(1.5)
 
             except discord.Forbidden:
                 print("  오류: 채널에 메시지(Embed)를 보낼 권한이 없습니다.")
+                # break
             except discord.HTTPException as e:
                 print(f"  오류: 채널 메시지(Embed) 전송 중 Discord API 오류: {e.status} - {e.text}")
                 if e.status == 429:
@@ -285,35 +312,13 @@ async def fetch_feed(channel, site_colors):
                     print(f"  Discord Rate Limit 감지. {retry_after:.1f}초 대기 후 계속합니다.")
                     await asyncio.sleep(retry_after)
             except Exception as e:
-                print(f"  오류: 메시지(Embed) 전송 중 예상치 못한 오류: {e}")
+                print(f"  오류: 메시지(Embed) 전송 또는 처리 중 예상치 못한 오류: {e}")
 
             if new_articles_processed_count % 15 == 0:
                  print(f"  15개 항목 처리 후 잠시 대기...")
                  await asyncio.sleep(60)
 
     print(f"채널 {channel_id_str}: 총 {new_articles_processed_count}개의 새 기사 처리 완료.")
-
-    async with yaml_lock:
-        try:
-            if len(sent_articles) > max_keep:
-                original_count = len(sent_articles)
-                sent_articles = sent_articles[-max_keep:]
-                print(f"채널 {channel_id_str}: 오래된 기사 링크 정리. {original_count} -> {len(sent_articles)}개 유지.")
-
-            if os.path.exists(sent_articles_file):
-                    with open(sent_articles_file, "r", encoding='utf-8') as f:
-                        all_sent_data = yaml.safe_load(f) or {}
-            else:
-                 all_sent_data = {}
-
-            all_sent_data[channel_id_str] = sent_articles
-
-            with open(sent_articles_file, "w", encoding='utf-8') as f:
-                yaml.dump(all_sent_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-            print("sent_articles.yaml 파일 저장 완료")
-        except Exception as e:
-            print(f"sent_articles.yaml 파일 저장 중 오류 발생: {e}")
-
 
 @client.event
 async def on_ready():
