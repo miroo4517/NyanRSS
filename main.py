@@ -1,72 +1,100 @@
 import discord
 import feedparser
 import os
-from dotenv import load_dotenv
 import yaml
 import asyncio
 import google.generativeai as genai
 import re
 import time
 import datetime
+import PIL
+import requests
+from dotenv import load_dotenv
 from discord import Embed, Color, utils
 from urllib.parse import urlparse
+from io import BytesIO
 
 load_dotenv()
 intents = discord.Intents.all()
 client = discord.Client(intents=intents)
 
-try:
-    DISCORD_CHANNEL_IDS = list(map(int, os.getenv('DISCORD_CHANNEL_IDS', '').split(',')))
-    DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-    RSS_FEED_URLS = os.getenv('RSS_FEED_URLS', '').split(",")
-    GOOGLE_API_KEY = os.getenv('GEMINI_API_KEY')
+DISCORD_CHANNEL_IDS = []
+DISCORD_BOT_TOKEN = ""
+RSS_FEED_URLS = []
+GOOGLE_API_KEY = ""
+site_color_map = {}
 
-    SITE_COLORS_STR = os.getenv('SITE_COLORS', '')
-    site_color_map = {}
-    if SITE_COLORS_STR:
-        pairs = SITE_COLORS_STR.split(',')
-        for pair in pairs:
-            if ':' in pair:
-                try:
-                    url, hex_color = pair.strip().rsplit(':', 1)
-                    if re.match(r'^#[0-9a-fA-F]{6}$', hex_color):
-                        site_color_map[url.strip()] = hex_color.strip()
-                    else:
-                        print(f"경고: .env의 SITE_COLORS에 잘못된 HEX 코드 형식 발견 - '{pair.strip()}' 건너뜁니다.")
-                except ValueError:
-                    print(f"경고: .env의 SITE_COLORS 형식 오류 - '{pair.strip()}' 건너뜁니다.")
-            else:
-                print(f"경고: .env의 SITE_COLORS 형식 오류 (콜론 없음) - '{pair.strip()}' 건너뜁니다.")
-    print(f"사이트별 색상 설정 로드: {len(site_color_map)}개")
+def load_initial_config():
+    global DISCORD_CHANNEL_IDS, DISCORD_BOT_TOKEN, RSS_FEED_URLS, GOOGLE_API_KEY, site_color_map
+    try:
+        channel_ids_str = os.getenv('DISCORD_CHANNEL_IDS', '')
+        if channel_ids_str:
+            DISCORD_CHANNEL_IDS = list(map(int, channel_ids_str.split(',')))
+        else:
+            DISCORD_CHANNEL_IDS = []
 
-    if not all([DISCORD_CHANNEL_IDS, DISCORD_BOT_TOKEN, RSS_FEED_URLS, GOOGLE_API_KEY]):
-        raise ValueError("필수 환경 변수 중 일부가 설정되지 않았습니다 (.env 파일 확인)")
-except ValueError as e:
-    print(f"환경 변수 로드 오류: {e}")
-    exit()
+        DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+        RSS_FEED_URLS = os.getenv('RSS_FEED_URLS', '').split(",")
+        GOOGLE_API_KEY = os.getenv('GEMINI_API_KEY')
+
+        SITE_COLORS_STR = os.getenv('SITE_COLORS', '')
+        site_color_map = {}
+        if SITE_COLORS_STR:
+            pairs = SITE_COLORS_STR.split(',')
+            for pair in pairs:
+                if ':' in pair:
+                    try:
+                        url, hex_color = pair.strip().rsplit(':', 1)
+                        if re.match(r'^#[0-9a-fA-F]{6}$', hex_color):
+                            site_color_map[url.strip()] = hex_color.strip()
+                        else:
+                            print(f"경고: .env의 SITE_COLORS에 잘못된 HEX 코드 형식 발견 - '{pair.strip()}' 건너뜁니다.")
+                    except ValueError:
+                        print(f"경고: .env의 SITE_COLORS 형식 오류 - '{pair.strip()}' 건너뜁니다.")
+                else:
+                    print(f"경고: .env의 SITE_COLORS 형식 오류 (콜론 없음) - '{pair.strip()}' 건너뜁니다.")
+        print(f"사이트별 색상 설정 로드: {len(site_color_map)}개")
+
+        if not all([DISCORD_BOT_TOKEN, RSS_FEED_URLS, GOOGLE_API_KEY]):
+            raise ValueError("필수 환경 변수 중 일부가 설정되지 않았습니다 (DISCORD_BOT_TOKEN, RSS_FEED_URLS, GEMINI_API_KEY 확인)")
+
+        print(f"초기 채널 ID 로드: {DISCORD_CHANNEL_IDS}")
+        return True
+
+    except ValueError as e:
+        print(f"환경 변수 로드 오류: {e}")
+        return False
+    except Exception as e:
+        print(f"설정 로드 중 예상치 못한 오류: {e}")
+        return False
 
 EMOJI = "\U0001F4F0"
 sent_articles_file = "sent_articles.yaml"
 yaml_lock = asyncio.Lock()
 max_keep = 5000
+model = None
 
-try:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    generation_config = {
-        "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 256,
-    }
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash",
-                                  generation_config=generation_config,
-                                  safety_settings=safety_settings)
-except Exception as e:
-    print(f"Gemini 설정 중 오류 발생: {e}")
-    exit()
+def setup_gemini():
+    global model
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        generation_config = {
+            "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 256,
+        }
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash",
+                                      generation_config=generation_config,
+                                      safety_settings=safety_settings)
+        print("Gemini 모델 설정 완료.")
+        return True
+    except Exception as e:
+        print(f"Gemini 설정 중 오류 발생: {e}")
+        return False
 
 def clean_html(raw_html):
     if not raw_html: return ""
@@ -77,8 +105,8 @@ def clean_html(raw_html):
     return cleantext.strip()
 
 async def summarize_article(content):
-    if not content or len(content) < 30:
-        return "요약할 내용이 충분하지 않습니다."
+    if not model or not content or len(content) < 30:
+        return "Gemini 모델이 설정되지 않았거나 요약할 내용이 충분하지 않습니다."
     try:
         prompt = f"""너는 이제부터 기사 요약하는 고양이다냥! 다음 뉴스기사 내용을 한국어로 간결하게 5~7문장 이내로, 최대한 줄바꿈 없이, 반말(중요)로 요약해달라냥! 무조건 말 끝에 냥을 붙이고 고양이 이모티콘도 자주 쓰고 고양이답게 말투도 엄청 귀여워야 한다냥! 가능하다면 배경지식도 넣어서 요약해달라냥! 항상 요약은 냐옹!으로 시작하고 마지막에는 냥냥!으로 끝나야 한다냥!:
 
@@ -121,6 +149,13 @@ async def load_sent_articles(channel_id_str):
                     return []
                 print(f"채널 {channel_id_str}: 기존 {len(sent_articles)}개 기사 링크 로드됨")
                 return sent_articles
+            except yaml.YAMLError as e:
+                print(f"YAML 파일 파싱 오류 ({sent_articles_file}): {e}. 파일을 백업하고 새로 시작합니다.")
+                try:
+                    os.rename(sent_articles_file, f"{sent_articles_file}.bak_{int(time.time())}")
+                except OSError as backup_err:
+                    print(f"  오류: YAML 파일 백업 실패: {backup_err}")
+                return []
             except Exception as e:
                 print(f"YAML 파일 로드 오류: {e}")
                 return []
@@ -128,18 +163,29 @@ async def load_sent_articles(channel_id_str):
             print("sent_articles.yaml 파일을 찾을 수 없어 새로 생성합니다.")
             return []
 
-async def save_sent_article(channel_id_str, article_link, current_sent_list):
+async def save_sent_article(channel_id_str, article_link):
     async with yaml_lock:
         try:
+            all_sent_data = {}
             if os.path.exists(sent_articles_file):
-                with open(sent_articles_file, "r", encoding='utf-8') as f:
-                    all_sent_data = yaml.safe_load(f) or {}
-            else:
-                all_sent_data = {}
+                try:
+                    with open(sent_articles_file, "r", encoding='utf-8') as f:
+                        all_sent_data = yaml.safe_load(f) or {}
+                        if not isinstance(all_sent_data, dict):
+                            print(f"경고: {sent_articles_file} 파일 내용이 딕셔너리가 아닙니다. 새로 생성합니다.")
+                            all_sent_data = {}
+                except yaml.YAMLError as e:
+                     print(f"YAML 파일 파싱 오류 ({sent_articles_file}) 저장 시: {e}. 파일을 백업하고 새로 시작합니다.")
+                     try:
+                         os.rename(sent_articles_file, f"{sent_articles_file}.bak_{int(time.time())}")
+                     except OSError as backup_err:
+                         print(f"  오류: YAML 파일 백업 실패: {backup_err}")
+                     all_sent_data = {}
 
-            channel_sent_list = all_sent_data.get(channel_id_str, [])
+            channel_key = str(channel_id_str)
+            channel_sent_list = all_sent_data.get(channel_key, [])
             if not isinstance(channel_sent_list, list):
-                print(f"경고: 파일 저장 중 채널 {channel_id_str} 데이터가 리스트가 아님. 재생성.")
+                print(f"경고: 파일 저장 중 채널 {channel_key} 데이터가 리스트가 아님. 재생성.")
                 channel_sent_list = []
 
             if article_link not in channel_sent_list:
@@ -148,24 +194,25 @@ async def save_sent_article(channel_id_str, article_link, current_sent_list):
             if len(channel_sent_list) > max_keep:
                 original_count = len(channel_sent_list)
                 channel_sent_list = channel_sent_list[-max_keep:]
-                print(f"채널 {channel_id_str}: 오래된 기사 링크 정리 (파일 저장 시). {original_count} -> {len(channel_sent_list)}개 유지.")
+                print(f"채널 {channel_key}: 오래된 기사 링크 정리 (파일 저장 시). {original_count} -> {len(channel_sent_list)}개 유지.")
 
-            all_sent_data[channel_id_str] = channel_sent_list
+            all_sent_data[channel_key] = channel_sent_list
+
             with open(sent_articles_file, "w", encoding='utf-8') as f:
                 yaml.dump(all_sent_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-            print(f"채널 {channel_id_str}: 기사 '{article_link}' 전송 완료 및 YAML 저장됨.")
+            print(f"채널 {channel_key}: 기사 '{article_link}' 전송 완료 및 YAML 저장됨.")
 
         except Exception as e:
             print(f"sent_articles.yaml 파일 저장 중 오류 발생 (개별 저장): {e}")
 
-async def fetch_feed(channel, site_colors):
+async def fetch_feed(channel, site_colors, current_rss_feeds):
     channel_id_str = str(channel.id)
     sent_articles = await load_sent_articles(channel_id_str)
     sent_articles_set = set(sent_articles)
 
     new_articles_processed_count = 0
 
-    for rss_feed_url in RSS_FEED_URLS:
+    for rss_feed_url in current_rss_feeds:
         if not rss_feed_url: continue
 
         print(f"채널 {channel_id_str}: '{rss_feed_url}' 피드 파싱 중...")
@@ -179,7 +226,8 @@ async def fetch_feed(channel, site_colors):
         except Exception as e:
             print(f"  오류: '{rss_feed_url}' 피드 파싱 중 심각한 오류: {e}")
             continue
-        print(f"  파싱 완료 ({len(feed.entries)}개 항목). 소요 시간: {time.monotonic() - feed_start_time:.2f}초")
+        parse_duration = time.monotonic() - feed_start_time
+        print(f"  파싱 완료 ({len(feed.entries)}개 항목). 소요 시간: {parse_duration:.2f}초")
 
         if not feed.entries:
             print(f"  '{rss_feed_url}' 피드에 항목이 없습니다.")
@@ -209,14 +257,17 @@ async def fetch_feed(channel, site_colors):
                 print("      Gemini API로 요약 요청 중...")
                 summary_start_time = time.monotonic()
                 summary = await summarize_article(article_content_text)
-                print(f"      요약 완료. 소요 시간: {time.monotonic() - summary_start_time:.2f}초")
+                summary_duration = time.monotonic() - summary_start_time
+                print(f"      요약 완료. 소요 시간: {summary_duration:.2f}초")
             else:
                 print("      요약할 내용이 없어 Gemini 호출을 건너뜁니다.")
                 summary = "기사 본문 내용이 없어 요약할 수 없습니다."
 
             try:
                 embed_color = Color.blue()
-                hex_color_str = site_colors.get(rss_feed_url)
+                parsed_uri = urlparse(rss_feed_url)
+                base_url = f"{parsed_uri.scheme}://{parsed_uri.netloc}"
+                hex_color_str = site_color_map.get(rss_feed_url) or site_color_map.get(base_url)
 
                 if hex_color_str:
                     try:
@@ -297,7 +348,7 @@ async def fetch_feed(channel, site_colors):
                 await channel.send(embed=embed)
                 print("      >> Embed 전송 성공.")
 
-                await save_sent_article(channel_id_str, article_id, list(sent_articles_set))
+                await save_sent_article(channel_id_str, article_id)
                 sent_articles_set.add(article_id)
 
                 await asyncio.sleep(1.5)
@@ -314,15 +365,82 @@ async def fetch_feed(channel, site_colors):
             except Exception as e:
                 print(f"  오류: 메시지(Embed) 전송 또는 처리 중 예상치 못한 오류: {e}")
 
-            if new_articles_processed_count % 15 == 0:
+            if new_articles_processed_count > 0 and new_articles_processed_count % 15 == 0:
                  print(f"  15개 항목 처리 후 잠시 대기...")
                  await asyncio.sleep(60)
 
     print(f"채널 {channel_id_str}: 총 {new_articles_processed_count}개의 새 기사 처리 완료.")
 
+# @client.event
+# async def on_ready():
+#     print(f"봇 로그인: {client.user.name} (ID: {client.user.id})")
+#     print(f"등록된 채널 ID: {DISCORD_CHANNEL_IDS}")
+#     print(f"등록된 RSS 피드 수: {len(RSS_FEED_URLS)}")
+#     print(f"로드된 사이트별 색상 수: {len(site_color_map)}")
+#     print("-" * 20)
+#     print("봇이 준비되었습니다. 10초 후 첫 RSS 피드 확인을 시작합니다.")
+#     await asyncio.sleep(10)
+
+#     while True:
+#         print("-" * 20)
+#         start_time = time.monotonic()
+#         print(f"{datetime.datetime.now()} - RSS 피드 확인 주기 시작...")
+#         active_tasks = []
+#         for channel_id in DISCORD_CHANNEL_IDS:
+#             channel = client.get_channel(channel_id)
+#             if channel and isinstance(channel, discord.TextChannel):
+#                 print(f"  -> 채널 '{channel.name}' (ID: {channel.id}) 작업 생성 중...")
+#                 task = asyncio.create_task(fetch_feed(channel, site_color_map), name=f"fetch_feed_{channel_id}")
+#                 active_tasks.append(task)
+#             elif channel:
+#                  print(f"경고: 채널 ID {channel_id}는 텍스트 채널이 아닙니다: {type(channel)}")
+#             else:
+#                  print(f"경고: 채널 ID {channel_id}를 찾을 수 없거나 접근할 수 없습니다.")
+
+#         if active_tasks:
+#             results = await asyncio.gather(*active_tasks, return_exceptions=True)
+#             for i, result in enumerate(results):
+#                  if isinstance(result, Exception):
+#                      task_name = active_tasks[i].get_name()
+#                      print(f"오류: 작업 '{task_name}' 실행 중 예외 발생: {type(result).__name__} - {result}")
+
+#             print(f"  -> 모든 채널 작업 완료 ({len(active_tasks)}개)")
+#         else:
+#             print("  -> 처리할 유효한 채널이 없습니다.")
+
+#         end_time = time.monotonic()
+#         print(f"{datetime.datetime.now()} - RSS 피드 확인 주기 완료 (총 소요 시간: {end_time - start_time:.2f}초)")
+#         wait_time = 600
+#         print(f"다음 확인까지 {wait_time // 60}분 대기...")
+#         await asyncio.sleep(wait_time)
+
+# if __name__ == "__main__":
+#     print("봇 시작 중...")
+#     try:
+#         client.run(DISCORD_BOT_TOKEN)
+#     except discord.LoginFailure:
+#         print("오류: 잘못된 디스코드 봇 토큰입니다.")
+#     except discord.PrivilegedIntentsRequired:
+#         print("오류: Privileged Intents가 활성화되지 않았습니다.")
+#         print("Discord 개발자 포털에서 봇의 Privileged Gateway Intents (특히 Message Content Intent)를 확인/활성화하세요.")
+#     except Exception as e:
+#         print(f"봇 실행 중 심각한 오류 발생: {e}")
+
 @client.event
 async def on_ready():
+    global DISCORD_CHANNEL_IDS, RSS_FEED_URLS, site_color_map
+
     print(f"봇 로그인: {client.user.name} (ID: {client.user.id})")
+
+    if not load_initial_config():
+        print("초기 설정 로드 실패. 봇을 종료합니다.")
+        await client.close()
+        return
+
+    if not setup_gemini():
+        print("Gemini 모델 설정 실패. 요약 기능 없이 계속하거나 봇을 종료합니다.")
+        await client.close(); return
+
     print(f"등록된 채널 ID: {DISCORD_CHANNEL_IDS}")
     print(f"등록된 RSS 피드 수: {len(RSS_FEED_URLS)}")
     print(f"로드된 사이트별 색상 수: {len(site_color_map)}")
@@ -334,37 +452,109 @@ async def on_ready():
         print("-" * 20)
         start_time = time.monotonic()
         print(f"{datetime.datetime.now()} - RSS 피드 확인 주기 시작...")
-        active_tasks = []
-        for channel_id in DISCORD_CHANNEL_IDS:
-            channel = client.get_channel(channel_id)
-            if channel and isinstance(channel, discord.TextChannel):
-                print(f"  -> 채널 '{channel.name}' (ID: {channel.id}) 작업 생성 중...")
-                task = asyncio.create_task(fetch_feed(channel, site_color_map), name=f"fetch_feed_{channel_id}")
-                active_tasks.append(task)
-            elif channel:
-                 print(f"경고: 채널 ID {channel_id}는 텍스트 채널이 아닙니다: {type(channel)}")
-            else:
-                 print(f"경고: 채널 ID {channel_id}를 찾을 수 없거나 접근할 수 없습니다.")
 
-        if active_tasks:
-            results = await asyncio.gather(*active_tasks, return_exceptions=True)
-            for i, result in enumerate(results):
-                 if isinstance(result, Exception):
-                     task_name = active_tasks[i].get_name()
-                     print(f"오류: 작업 '{task_name}' 실행 중 예외 발생: {type(result).__name__} - {result}")
+        current_channel_ids_to_process = list(DISCORD_CHANNEL_IDS)
+        current_rss_feeds_to_process = list(RSS_FEED_URLS)
+        current_site_colors = dict(site_color_map)
 
-            print(f"  -> 모든 채널 작업 완료 ({len(active_tasks)}개)")
+        if not current_channel_ids_to_process:
+            print("  처리할 채널이 없습니다. 대기합니다.")
         else:
-            print("  -> 처리할 유효한 채널이 없습니다.")
+            active_tasks = []
+            for channel_id in current_channel_ids_to_process:
+                channel = client.get_channel(channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    print(f"  -> 채널 '{channel.name}' (ID: {channel.id}) 작업 생성 중...")
+                    task = asyncio.create_task(fetch_feed(channel, current_site_colors, current_rss_feeds_to_process), name=f"fetch_feed_{channel_id}")
+                    active_tasks.append(task)
+                elif channel:
+                     print(f"경고: 채널 ID {channel_id}는 텍스트 채널이 아닙니다: {type(channel)}")
+                else:
+                     print(f"경고: 채널 ID {channel_id}를 찾을 수 없거나 접근할 수 없습니다. (봇이 해당 서버에 있고 권한이 있는지 확인)")
+
+            if active_tasks:
+                results = await asyncio.gather(*active_tasks, return_exceptions=True)
+                for i, result in enumerate(results):
+                     if isinstance(result, Exception):
+                         task_name = active_tasks[i].get_name()
+                         print(f"오류: 작업 '{task_name}' 실행 중 예외 발생: {type(result).__name__} - {result}")
+
+                print(f"  -> 모든 채널 작업 완료 ({len(active_tasks)}개)")
+            else:
+                print("  -> 처리할 유효한 채널이 없습니다.")
+
+        print(f"{datetime.datetime.now()} - .env 파일에서 설정 다시 로드 시도...")
+        try:
+            dotenv_path = load_dotenv(override=True, verbose=False)
+            if dotenv_path:
+                new_channel_ids_str = os.getenv('DISCORD_CHANNEL_IDS', '')
+                new_channel_ids = []
+                if new_channel_ids_str:
+                    try:
+                        new_channel_ids = list(map(int, new_channel_ids_str.split(',')))
+                    except ValueError:
+                        print("  오류: .env의 DISCORD_CHANNEL_IDS 형식이 잘못되었습니다 (숫자 목록이어야 함). 채널 ID 업데이트 실패.")
+                        new_channel_ids = list(DISCORD_CHANNEL_IDS)
+
+                if new_channel_ids != DISCORD_CHANNEL_IDS:
+                    print(f"  성공: DISCORD_CHANNEL_IDS 업데이트됨: {new_channel_ids}")
+                    DISCORD_CHANNEL_IDS = new_channel_ids
+                else:
+                    print("  정보: DISCORD_CHANNEL_IDS 변경 없음.")
+
+                new_rss_urls_str = os.getenv('RSS_FEED_URLS', '')
+                new_rss_urls = [url.strip() for url in new_rss_urls_str.split(',') if url.strip()]
+                if new_rss_urls != RSS_FEED_URLS:
+                    print(f"  성공: RSS_FEED_URLS 업데이트됨 (총 {len(new_rss_urls)}개)")
+                    RSS_FEED_URLS = new_rss_urls
+                else:
+                    print("  정보: RSS_FEED_URLS 변경 없음.")
+
+                new_site_colors_str = os.getenv('SITE_COLORS', '')
+                new_site_color_map = {}
+                if new_site_colors_str:
+                    pairs = new_site_colors_str.split(',')
+                    for pair in pairs:
+                        if ':' in pair:
+                            try:
+                                url, hex_color = pair.strip().rsplit(':', 1)
+                                if re.match(r'^#[0-9a-fA-F]{6}$', hex_color):
+                                    new_site_color_map[url.strip()] = hex_color.strip()
+                                else:
+                                    print(f"  경고: .env의 SITE_COLORS 업데이트 중 잘못된 HEX 코드 형식 발견 - '{pair.strip()}' 건너뜁니다.")
+                            except ValueError:
+                                print(f"  경고: .env의 SITE_COLORS 업데이트 중 형식 오류 - '{pair.strip()}' 건너뜁니다.")
+                        else:
+                            print(f"  경고: .env의 SITE_COLORS 업데이트 중 형식 오류 (콜론 없음) - '{pair.strip()}' 건너뜁니다.")
+
+                if new_site_color_map != site_color_map:
+                     print(f"  성공: SITE_COLORS 업데이트됨 (총 {len(new_site_color_map)}개)")
+                     site_color_map = new_site_color_map
+                else:
+                     print("  정보: SITE_COLORS 변경 없음.")
+
+            else:
+                 print("  정보: .env 파일을 찾을 수 없거나 로드되지 않았습니다. 기존 설정 유지.")
+
+        except Exception as e:
+            print(f"  오류: .env 파일 다시 로드 또는 처리 중 오류 발생: {e}. 기존 설정 유지.")
 
         end_time = time.monotonic()
         print(f"{datetime.datetime.now()} - RSS 피드 확인 주기 완료 (총 소요 시간: {end_time - start_time:.2f}초)")
+
         wait_time = 600
         print(f"다음 확인까지 {wait_time // 60}분 대기...")
         await asyncio.sleep(wait_time)
 
 if __name__ == "__main__":
     print("봇 시작 중...")
+    if not load_initial_config():
+        print("필수 환경 변수 로드 실패. .env 파일을 확인하세요.")
+        exit()
+    if not DISCORD_BOT_TOKEN:
+        print("오류: DISCORD_BOT_TOKEN이 설정되지 않았습니다.")
+        exit()
+
     try:
         client.run(DISCORD_BOT_TOKEN)
     except discord.LoginFailure:
@@ -374,3 +564,5 @@ if __name__ == "__main__":
         print("Discord 개발자 포털에서 봇의 Privileged Gateway Intents (특히 Message Content Intent)를 확인/활성화하세요.")
     except Exception as e:
         print(f"봇 실행 중 심각한 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
