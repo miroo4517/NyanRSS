@@ -79,7 +79,7 @@ def setup_gemini():
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
         generation_config = {
-            "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 256,
+            "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 65535,
         }
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
