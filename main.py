@@ -87,7 +87,7 @@ def setup_gemini():
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash",
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash",
                                       generation_config=generation_config,
                                       safety_settings=safety_settings)
         print("Gemini 모델 설정 완료.")
@@ -472,9 +472,9 @@ async def fetch_feed(channel, site_colors, current_rss_feeds):
             except Exception as e:
                 print(f"   오류: 메시지(Embed) 전송 또는 처리 중 예상치 못한 오류: {e}")
 
-            if new_articles_processed_count > 0 and new_articles_processed_count % 15 == 0:
-                   print(f"   15개 항목 처리 후 잠시 대기...")
-                   await asyncio.sleep(60)
+            if new_articles_processed_count > 0 and new_articles_processed_count % 5 == 0:
+                   print(f"   5개 항목 처리 후 잠시 대기...")
+                   await asyncio.sleep(30)
 
     print(f"채널 {channel_id_str}: 총 {new_articles_processed_count}개의 새 기사 처리 완료.")
 
