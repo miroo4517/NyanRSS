@@ -128,8 +128,6 @@ async def summarize_article(content, image_base64=None, image_media_type=None):
             "messages": [
                 {"role": "user", "content": user_content}
             ],
-            "temperature": 0.7,
-            "max_tokens": 65535,
         }
 
         def _call_api():
