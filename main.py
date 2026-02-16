@@ -3,16 +3,14 @@ import feedparser
 import os
 import yaml
 import asyncio
-import google.generativeai as genai
+import base64
 import re
 import time
 import datetime
-import PIL.Image
 import requests
 from dotenv import load_dotenv
 from discord import Embed, Color, utils
 from urllib.parse import urlparse
-from io import BytesIO
 
 load_dotenv()
 intents = discord.Intents.all()
@@ -21,11 +19,13 @@ client = discord.Client(intents=intents)
 DISCORD_CHANNEL_IDS = []
 DISCORD_BOT_TOKEN = ""
 RSS_FEED_URLS = []
-GOOGLE_API_KEY = ""
+OPENROUTER_API_KEY = ""
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = ""
 site_color_map = {}
 
 def load_initial_config():
-    global DISCORD_CHANNEL_IDS, DISCORD_BOT_TOKEN, RSS_FEED_URLS, GOOGLE_API_KEY, site_color_map
+    global DISCORD_CHANNEL_IDS, DISCORD_BOT_TOKEN, RSS_FEED_URLS, OPENROUTER_API_KEY, OPENROUTER_MODEL, site_color_map
     try:
         channel_ids_str = os.getenv('DISCORD_CHANNEL_IDS', '')
         if channel_ids_str:
@@ -35,7 +35,8 @@ def load_initial_config():
 
         DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
         RSS_FEED_URLS = os.getenv('RSS_FEED_URLS', '').split(",")
-        GOOGLE_API_KEY = os.getenv('GEMINI_API_KEY')
+        OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+        OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'google/gemini-2.5-flash')
 
         SITE_COLORS_STR = os.getenv('SITE_COLORS', '')
         site_color_map = {}
@@ -55,8 +56,8 @@ def load_initial_config():
                     print(f"경고: .env의 SITE_COLORS 형식 오류 (콜론 없음) - '{pair.strip()}' 건너뜁니다.")
         print(f"사이트별 색상 설정 로드: {len(site_color_map)}개")
 
-        if not all([DISCORD_BOT_TOKEN, RSS_FEED_URLS, GOOGLE_API_KEY]):
-            raise ValueError("필수 환경 변수 중 일부가 설정되지 않았습니다 (DISCORD_BOT_TOKEN, RSS_FEED_URLS, GEMINI_API_KEY 확인)")
+        if not all([DISCORD_BOT_TOKEN, RSS_FEED_URLS, OPENROUTER_API_KEY, OPENROUTER_MODEL]):
+            raise ValueError("필수 환경 변수 중 일부가 설정되지 않았습니다 (DISCORD_BOT_TOKEN, RSS_FEED_URLS, OPENROUTER_API_KEY, OPENROUTER_MODEL 확인)")
 
         print(f"초기 채널 ID 로드: {DISCORD_CHANNEL_IDS}")
         return True
@@ -72,29 +73,6 @@ EMOJI = "\U0001F4F0"
 sent_articles_file = "sent_articles.yaml"
 yaml_lock = asyncio.Lock()
 max_keep = 5000
-model = None
-
-def setup_gemini():
-    global model
-    try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        generation_config = {
-            "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 65535,
-        }
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash",
-                                      generation_config=generation_config,
-                                      safety_settings=safety_settings)
-        print("Gemini 모델 설정 완료.")
-        return True
-    except Exception as e:
-        print(f"Gemini 설정 중 오류 발생: {e}")
-        return False
 
 def clean_html(raw_html):
     if not raw_html: return ""
@@ -104,56 +82,93 @@ def clean_html(raw_html):
     cleantext = ' '.join(cleantext.split())
     return cleantext.strip()
 
-async def summarize_article(content, image_pil=None):
-    if not model:
-        return "Gemini 모델이 설정되지 않았습니다."
-    if not content and not image_pil:
+async def summarize_article(content, image_base64=None, image_media_type=None):
+    if not OPENROUTER_API_KEY:
+        return "OpenRouter API 키가 설정되지 않았습니다."
+    if not content and not image_base64:
          return "요약할 내용이나 이미지가 없습니다."
-    if content and len(content) < 30 and not image_pil:
+    if content and len(content) < 30 and not image_base64:
         return "요약할 내용이 충분하지 않습니다."
 
     try:
-        prompt = f"""너는 이제부터 기사 요약하는 고양이다냥! 다음 뉴스기사 내용과 이미지를 보고 한국어로 간결하게 5~7문장 이내로, 최대한 줄바꿈 없이, 반말(중요)로 요약해달라냥! 무조건 말 끝에 냥을 붙이고 고양이 이모티콘도 자주 쓰고 고양이답게 말투도 엄청 귀여워야 한다냥! 가능하다면 배경지식도 넣어서 요약해달라냥! 항상 요약은 냐옹!으로 시작하고 마지막에는 냥냥!으로 끝나야 한다냥!:
+        user_content = []
+
+        if content:
+            prompt = f"""너는 이제부터 기사 요약하는 고양이다냥! 다음 뉴스기사 내용과 이미지를 보고 한국어로 간결하게 5~7문장 이내로, 최대한 줄바꿈 없이, 반말(중요)로 요약해달라냥! 무조건 말 끝에 냥을 붙이고 고양이 이모티콘도 자주 쓰고 고양이답게 말투도 엄청 귀여워야 한다냥! 가능하다면 배경지식도 넣어서 요약해달라냥! 항상 요약은 냐옹!으로 시작하고 마지막에는 냥냥!으로 끝나야 한다냥!:
 
         ---
         {content[:1500] if content else "텍스트 내용 없음"}
         ---
 
         요약:"""
+            user_content.append({"type": "text", "text": prompt})
 
-        api_content = []
-        if content:
-            api_content.append(prompt)
-        if image_pil:
-            api_content.append(image_pil)
+        if image_base64:
+            data_uri = f"data:{image_media_type or 'image/jpeg'};base64,{image_base64}"
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": data_uri}
+            })
             if not content:
-                 api_content.insert(0, "이 이미지를 보고 한국어로 간결하게 5~7문장 이내로, 최대한 줄바꿈 없이, 반말(중요)로 설명해달라냥! 무조건 말 끝에 냥을 붙이고 고양이 이모티콘도 자주 쓰고 고양이답게 말투도 엄청 귀여워야 한다냥! 항상 설명은 냐옹!으로 시작하고 마지막에는 냥냥!으로 끝나야 한다냥! 설명:")
+                user_content.insert(0, {
+                    "type": "text",
+                    "text": "이 이미지를 보고 한국어로 간결하게 5~7문장 이내로, 최대한 줄바꿈 없이, 반말(중요)로 설명해달라냥! 무조건 말 끝에 냥을 붙이고 고양이 이모티콘도 자주 쓰고 고양이답게 말투도 엄청 귀여워야 한다냥! 항상 설명은 냐옹!으로 시작하고 마지막에는 냥냥!으로 끝나야 한다냥! 설명:"
+                })
 
-        if not api_content:
+        if not user_content:
              return "API로 보낼 내용이 없습니다."
 
-        response = await model.generate_content_async(api_content)
+        api_headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-        if not response.candidates:
-            print("경고: Gemini API 응답에 후보가 없습니다. 안전 설정 또는 입력 문제일 수 있습니다.")
-            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
-                print(f"   프롬프트 피드백: {response.prompt_feedback}")
-            return "기사 요약 중 문제가 발생했습니다. (No candidates)"
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 65535,
+        }
 
-        summary = response.text.strip() if response.candidates else None
+        def _call_api():
+            return requests.post(
+                OPENROUTER_API_URL,
+                headers=api_headers,
+                json=payload,
+                timeout=60
+            )
+
+        loop = asyncio.get_running_loop()
+        api_response = await loop.run_in_executor(None, _call_api)
+        api_response.raise_for_status()
+
+        result = api_response.json()
+
+        if not result.get("choices"):
+            print("경고: OpenRouter API 응답에 choices가 없습니다.")
+            if result.get("error"):
+                print(f"   API 에러: {result['error']}")
+            return "기사 요약 중 문제가 발생했습니다. (No choices)"
+
+        summary = result["choices"][0]["message"]["content"].strip()
 
         if not summary:
-            print("경고: Gemini API가 빈 요약을 반환했습니다.")
+            print("경고: OpenRouter API가 빈 요약을 반환했습니다.")
             return "기사 내용을 요약할 수 없습니다."
 
-        summary = summary.replace(''', "'").replace(''', "'")
+        summary = summary.replace('\u2018', "'").replace('\u2019', "'")
 
         return summary
-    except Exception as e:
-        print(f"Gemini API 호출 중 오류 발생 ({type(e).__name__}): {e}")
-        if "400" in str(e) and "image" in str(e).lower():
+    except requests.exceptions.HTTPError as e:
+        print(f"OpenRouter API HTTP 오류 발생: {e.response.status_code} - {e.response.text[:200]}")
+        if e.response.status_code == 400 and "image" in e.response.text.lower():
              print("   -> 이미지 관련 API 오류일 수 있습니다. 이미지 형식이나 크기를 확인하세요.")
-             return f"이미지 처리 중 API 오류가 발생했습니다: {type(e).__name__}"
+             return f"이미지 처리 중 API 오류가 발생했습니다: HTTP {e.response.status_code}"
+        return f"기사 요약 중 API 오류가 발생했습니다: HTTP {e.response.status_code}"
+    except Exception as e:
+        print(f"OpenRouter API 호출 중 오류 발생 ({type(e).__name__}): {e}")
         return f"기사 요약 중 API 오류가 발생했습니다: {type(e).__name__}"
 
 async def load_sent_articles(channel_id_str):
@@ -369,35 +384,33 @@ async def fetch_feed(channel, site_colors, current_rss_feeds):
                                 print(f"       이미지 발견 (media_content): {image_url[:50]}...")
                                 break
 
-            pil_image = None
+            image_base64 = None
+            image_media_type = None
             if image_url:
                 try:
                     print(f"       이미지 다운로드 시도: {image_url}")
-                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 NyanRSS/1.0'}
-                    response = requests.get(image_url, headers=headers, stream=True, timeout=10)
-                    response.raise_for_status()
-                    image_bytes = BytesIO(response.content)
-                    pil_image = PIL.Image.open(image_bytes)
-                    print(f"       이미지 로드 성공: {pil_image.format}, {pil_image.size}")
+                    img_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 NyanRSS/1.0'}
+                    img_response = requests.get(image_url, headers=img_headers, stream=True, timeout=10)
+                    img_response.raise_for_status()
+                    image_media_type = img_response.headers.get('Content-Type', 'image/jpeg').split(';')[0].strip()
+                    image_base64 = base64.b64encode(img_response.content).decode('utf-8')
+                    print(f"       이미지 로드 성공: {image_media_type}, {len(img_response.content)} bytes")
                 except requests.exceptions.RequestException as req_err:
                     print(f"       오류: 이미지 다운로드 실패 ({image_url}): {req_err}")
-                    image_url = None
-                except PIL.UnidentifiedImageError:
-                    print(f"       오류: PIL이 이미지 파일을 식별할 수 없음 ({image_url}). 이미지 형식이 아니거나 손상되었을 수 있습니다.")
                     image_url = None
                 except Exception as img_err:
                     print(f"       오류: 이미지 처리 중 예상치 못한 오류 ({image_url}): {img_err}")
                     image_url = None
 
             summary = "요약 정보를 가져올 수 없었습니다."
-            if article_content_text or pil_image:
-                print("       Gemini API로 요약 요청 중...")
+            if article_content_text or image_base64:
+                print("       OpenRouter API로 요약 요청 중...")
                 summary_start_time = time.monotonic()
-                summary = await summarize_article(article_content_text, pil_image)
+                summary = await summarize_article(article_content_text, image_base64, image_media_type)
                 summary_duration = time.monotonic() - summary_start_time
                 print(f"       요약 완료. 소요 시간: {summary_duration:.2f}초")
             else:
-                print("       요약할 내용이나 이미지가 없어 Gemini 호출을 건너뜁니다.")
+                print("       요약할 내용이나 이미지가 없어 API 호출을 건너뜁니다.")
                 summary = "기사 본문 내용이나 이미지가 없어 요약할 수 없습니다."
 
             try:
@@ -488,9 +501,6 @@ async def on_ready():
         print("초기 설정 로드 실패. 봇을 종료합니다.")
         await client.close()
         return
-
-    if not setup_gemini():
-        print("Gemini 모델 설정 실패. 요약 기능 없이 계속하거나 봇을 종료합니다.")
 
     print(f"등록된 채널 ID: {DISCORD_CHANNEL_IDS}")
     print(f"등록된 RSS 피드 수: {len(RSS_FEED_URLS)}")
