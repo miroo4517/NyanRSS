@@ -143,7 +143,7 @@ NyanRSS/
 #### API 오류가 발생할 때
 1. OpenRouter API 키가 유효한지 확인
 2. 크레딧 잔액 확인
-3. 모델 이름이 올바른지 확인 ([OpenRouter Models](https://openrouter.ai/docs#models))
+3. 모델 이름이 올바른지 확인 ([OpenRouter Models](https://openrouter.ai/models))
 
 #### RSS 피드가 파싱되지 않을 때
 1. RSS URL이 유효한지 브라우저에서 확인
